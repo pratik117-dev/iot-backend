@@ -1,0 +1,122 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  USER
+}
+
+enum DeviceStatus {
+  ONLINE
+  OFFLINE
+  MAINTENANCE
+}
+
+enum DeviceType {
+  AIR_QUALITY
+  WEATHER
+  NOISE
+  WATER
+  MULTI_SENSOR
+  ARDUINO
+}
+
+enum AlertSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String
+  name      String?
+  role      UserRole @default(USER)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  devices Device[]
+
+  @@map("users")
+}
+
+model Device {
+  id        String       @id @default(cuid())
+  name      String
+  location  String
+  type      DeviceType   @default(ARDUINO)
+  status    DeviceStatus @default(OFFLINE)
+  userId    String
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sensorData SensorData[]
+  alerts     Alert[]
+
+  @@map("devices")
+}
+
+model SensorData {
+  id          String   @id @default(cuid())
+  deviceId    String
+
+  // Climate
+  temperature Float?
+  humidity    Float?
+
+  // Air quality
+  co2         Float?
+  pm25        Float?
+  pm10        Float?
+  airQuality  Float?   // maps from air_quality field sent by Arduino
+
+  // Other sensors
+  noise       Float?
+  ph          Float?
+  turbidity   Float?
+
+  // Arduino-specific
+  flame       Boolean? // fire/flame sensor — true = flame detected
+  rawDeviceId String?  // original device_id string sent by Arduino (e.g. "node-1")
+
+  createdAt   DateTime @default(now())
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, createdAt])
+  @@map("sensor_data")
+}
+
+model Alert {
+  id        String        @id @default(cuid())
+  message   String
+  severity  AlertSeverity
+  deviceId  String
+  resolved  Boolean       @default(false)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, createdAt])
+  @@map("alerts")
+}
+
+model SystemLog {
+  id        String   @id @default(cuid())
+  action    String
+  userId    String?
+  details   String?
+  createdAt DateTime @default(now())
+
+  @@map("system_logs")
+}
