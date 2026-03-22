@@ -1,23 +1,12 @@
 /**
- * HiveMQ Cloud MQTT Service — Arduino Edition
- * ─────────────────────────────────────────────────────────────────────────────
- * Connects to HiveMQ Cloud, receives Arduino sensor data, saves to PostgreSQL,
- * and pushes live updates to the dashboard via WebSocket.
+ * HiveMQ Cloud MQTT Service
+ * ──────────────────────────────────────────────────────────────────────────────
+ * Connects to HiveMQ Cloud over TLS (port 8883), subscribes to all sensor
+ * topics, saves incoming readings to PostgreSQL, and broadcasts live updates
+ * to connected WebSocket clients.
  *
- * Fixes applied:
- *   1. clientId always has a random suffix → prevents HiveMQ kicking duplicate
- *      connections (which caused the connect/reconnect loop).
- *   2. reconnectPeriod = 0 → we handle reconnect manually with backoff.
- *   3. Topic prefix read from env at connect time, not hardcoded.
- *   4. Guard against double-connect calls.
- *
- * Arduino publishes to:
- *   enviraLog/node-1/data
- *   enviraLog/node-2/data
- *
- * Payload:
- *   { "device_id": "node-1", "temperature": 28.5, "humidity": 55.2,
- *     "air_quality": 95, "flame": false, "timestamp": "..." }
+ * The simulator runs IN PARALLEL — real device data and simulated data both
+ * flow into the same database and dashboard simultaneously.
  */
 
 import mqtt, { MqttClient, IClientOptions } from 'mqtt';
@@ -28,145 +17,123 @@ import { broadcast } from './websocket';
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
 export interface MqttConfig {
-  host:        string;
-  port:        number;
-  username:    string;
-  password:    string;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
   topicPrefix: string;
-  useTls:      boolean;
-  clientId:    string;
+  useTls: boolean;
+  clientId: string;
 }
 
 export interface MqttStatus {
-  connected:            boolean;
-  connecting:           boolean;
-  lastConnectedAt:      string | null;
-  lastDisconnectedAt:   string | null;
-  lastError:            string | null;
-  messagesReceived:     number;
-  readingsSaved:        number;
-  flameAlertsTriggered: number;
-  host:                 string | null;
-  clientId:             string | null;
+  connected: boolean;
+  connecting: boolean;
+  lastConnectedAt: string | null;
+  lastDisconnectedAt: string | null;
+  lastError: string | null;
+  messagesReceived: number;
+  readingsSaved: number;
+  host: string | null;
 }
 
 // ─── Thresholds ────────────────────────────────────────────────────────────────
 
 const THRESHOLDS = {
-  temperature: { warning: 60,  critical: 75  },
-  humidity:    { warning: 80,  critical: 90  },
-  airQuality:  { warning: 150, critical: 200 },
-  co2:         { warning: 1000, critical: 2000 },
-  noise:       { warning: 70,  critical: 85  },
+  co2: { warning: 1000, critical: 2000 },
+  pm25: { warning: 35, critical: 75 },
+  pm10: { warning: 150, critical: 250 },
+  temperature: { warning: 35, critical: 40 },
+  humidity: { warning: 80, critical: 90 },
+  noise: { warning: 70, critical: 85 },
 };
 
 // ─── Module state ──────────────────────────────────────────────────────────────
 
-let client:        MqttClient     | null = null;
-let wssRef:        WebSocketServer | null = null;
-let currentConfig: MqttConfig     | null = null;
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let isConnecting = false;   // guard against concurrent connect calls
+let client: MqttClient | null = null;
+let wssRef: WebSocketServer | null = null;
+let currentConfig: MqttConfig | null = null;
 
 const status: MqttStatus = {
-  connected:            false,
-  connecting:           false,
-  lastConnectedAt:      null,
-  lastDisconnectedAt:   null,
-  lastError:            null,
-  messagesReceived:     0,
-  readingsSaved:        0,
-  flameAlertsTriggered: 0,
-  host:                 null,
-  clientId:             null,
+  connected: false,
+  connecting: false,
+  lastConnectedAt: null,
+  lastDisconnectedAt: null,
+  lastError: null,
+  messagesReceived: 0,
+  readingsSaved: 0,
+  host: null,
 };
+
+// Accumulate single-field messages before flushing to DB
+const partialReadings: Map<string, Record<string, number | null>> = new Map();
+const partialTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
 // ─── Public API ────────────────────────────────────────────────────────────────
 
-export function getMqttStatus(): MqttStatus                        { return { ...status }; }
+export function getMqttStatus(): MqttStatus {
+  return { ...status };
+}
+
 export function getMqttConfig(): Omit<MqttConfig, 'password'> | null {
   if (!currentConfig) return null;
-  const { password: _p, ...safe } = currentConfig;
+  const { password: _omit, ...safe } = currentConfig;
   return safe;
 }
 
-export async function connectMqtt(config: MqttConfig, wss: WebSocketServer): Promise<void> {
-  // Guard — don't allow concurrent connect calls
-  if (isConnecting) {
-    console.log('MQTT: Connect already in progress, skipping duplicate call');
-    return;
-  }
+// ─── Connect / Disconnect ──────────────────────────────────────────────────────
 
+export async function connectMqtt(config: MqttConfig, wss: WebSocketServer): Promise<void> {
   await disconnectMqtt();
 
-  isConnecting   = true;
-  wssRef         = wss;
-  currentConfig  = config;
+  wssRef = wss;
+  currentConfig = config;
 
   const protocol = config.useTls ? 'mqtts' : 'mqtt';
-  const url      = `${protocol}://${config.host}:${config.port}`;
-
-  // ── CRITICAL FIX: always use a unique clientId ─────────────────────────────
-  // HiveMQ Cloud disconnects the OLD connection when a NEW client connects with
-  // the same clientId. This creates an infinite reconnect loop if two server
-  // processes share the same fixed clientId (e.g. from .env).
-  // Adding a random suffix makes every server instance uniquely identified.
-  const baseId   = (config.clientId || 'envirologapp-server').replace(/-[a-z0-9]{6}$/, '');
-  const uniqueId = `${baseId}-${Math.random().toString(36).slice(2, 8)}`;
+  const url = `${protocol}://${config.host}:${config.port}`;
 
   const options: IClientOptions = {
-    clientId:           uniqueId,
-    username:           config.username,
-    password:           config.password,
-    clean:              true,
-    reconnectPeriod:    0,       // ← disable built-in auto-reconnect; we do it manually
-    connectTimeout:     15000,
-    keepalive:          60,
-    rejectUnauthorized: false,   // HiveMQ Cloud self-signed cert OK
+    clientId: config.clientId || `envirologapp-${Date.now()}`,
+    username: config.username,
+    password: config.password,
+    clean: true,
+    reconnectPeriod: 5000,
+    connectTimeout: 15000,
+    keepalive: 60,
+    ...(config.useTls && { rejectUnauthorized: true }),
   };
 
   status.connecting = true;
-  status.lastError  = null;
-  status.host       = config.host;
-  status.clientId   = uniqueId;
+  status.lastError = null;
+  status.host = config.host;
 
   console.log(`\n🐝 MQTT: Connecting to HiveMQ Cloud`);
-  console.log(`   URL      : ${url}`);
-  console.log(`   ClientID : ${uniqueId}`);
-  console.log(`   Prefix   : ${config.topicPrefix}\n`);
+  console.log(`   Host     : ${config.host}:${config.port}`);
+  console.log(`   TLS      : ${config.useTls ? 'yes' : 'no'}`);
+  console.log(`   Prefix   : ${config.topicPrefix}`);
+  console.log(`   Client ID: ${options.clientId}\n`);
 
   client = mqtt.connect(url, options);
 
   client.on('connect', () => {
-    isConnecting               = false;
-    status.connected           = true;
-    status.connecting          = false;
-    status.lastConnectedAt     = new Date().toISOString();
-    status.lastError           = null;
-
-    console.log(`✅ MQTT: Connected to HiveMQ Cloud`);
-    console.log(`   Host  : ${config.host}`);
-    console.log(`   ID    : ${uniqueId}`);
+    status.connected = true;
+    status.connecting = false;
+    status.lastConnectedAt = new Date().toISOString();
+    console.log(`✅ MQTT: Connected to HiveMQ Cloud (${config.host})`);
 
     const prefix = config.topicPrefix.replace(/\/$/, '');
-    const topics = [
-      `${prefix}/+/data`,     // enviraLog/node-1/data  ← your Arduino pattern
-      `${prefix}/+/sensors`,  // alternative suffix
-      `${prefix}/sensors/#`,  // future-proof alternate structure
-      `${prefix}/status/#`,   // device online/offline
-    ];
+    const topics = [`${prefix}/sensors/#`, `${prefix}/status/#`];
 
     client!.subscribe(topics, { qos: 1 }, (err) => {
       if (err) {
-        console.error('MQTT: Subscribe error:', err.message);
+        console.error('MQTT: Subscription error:', err.message);
         status.lastError = err.message;
       } else {
-        console.log(`📡 MQTT: Subscribed to topics:`);
-        topics.forEach(t => console.log(`         ${t}`));
+        console.log(`📡 MQTT: Subscribed to: ${topics.join('  |  ')}`);
       }
     });
 
-    broadcastStatus();
+    broadcast(wss, { type: 'MQTT_STATUS', payload: getMqttStatus() });
   });
 
   client.on('message', (topic, message) => {
@@ -174,48 +141,44 @@ export async function connectMqtt(config: MqttConfig, wss: WebSocketServer): Pro
   });
 
   client.on('error', (err) => {
-    isConnecting     = false;
     status.lastError = err.message;
     status.connecting = false;
-    console.error('❌ MQTT Error:', err.message);
-    broadcastStatus();
-    scheduleReconnect();
-  });
-
-  client.on('close', () => {
-    isConnecting               = false;
-    status.connected           = false;
-    status.connecting          = false;
-    status.lastDisconnectedAt  = new Date().toISOString();
-    broadcastStatus();
-    // Only reconnect if we have a config (i.e. not a deliberate disconnect)
-    if (currentConfig) scheduleReconnect();
+    console.error('MQTT Error:', err.message);
+    if (wssRef) broadcast(wssRef, { type: 'MQTT_STATUS', payload: getMqttStatus() });
   });
 
   client.on('offline', () => {
-    status.connected          = false;
+    status.connected = false;
     status.lastDisconnectedAt = new Date().toISOString();
-    console.warn('⚠️  MQTT: Client offline');
-    broadcastStatus();
+    console.warn('MQTT: Went offline');
+    if (wssRef) broadcast(wssRef, { type: 'MQTT_STATUS', payload: getMqttStatus() });
+  });
+
+  client.on('reconnect', () => {
+    status.connecting = true;
+    console.log('MQTT: Reconnecting...');
+    if (wssRef) broadcast(wssRef, { type: 'MQTT_STATUS', payload: getMqttStatus() });
+  });
+
+  client.on('close', () => {
+    status.connected = false;
+    status.connecting = false;
+    status.lastDisconnectedAt = new Date().toISOString();
+    if (wssRef) broadcast(wssRef, { type: 'MQTT_STATUS', payload: getMqttStatus() });
   });
 }
 
 export async function disconnectMqtt(): Promise<void> {
-  // Cancel any pending reconnect
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-
-  currentConfig = null;  // prevents scheduleReconnect from firing after intentional disconnect
-  isConnecting  = false;
-
   if (client) {
     await new Promise<void>((resolve) => client!.end(true, {}, () => resolve()));
     client = null;
   }
-
-  status.connected           = false;
-  status.connecting          = false;
-  status.lastDisconnectedAt  = new Date().toISOString();
+  status.connected = false;
+  status.connecting = false;
+  status.lastDisconnectedAt = new Date().toISOString();
 }
+
+// ─── Publish ──────────────────────────────────────────────────────────────────
 
 export function publishMqtt(topic: string, payload: object): boolean {
   if (!client || !status.connected) return false;
@@ -223,52 +186,34 @@ export function publishMqtt(topic: string, payload: object): boolean {
   return true;
 }
 
+// ─── Auto-connect from environment ────────────────────────────────────────────
+
 export function autoConnectFromEnv(wss: WebSocketServer): void {
-  const host     = process.env.HIVEMQ_HOST;
+  const host = process.env.HIVEMQ_HOST;
   const username = process.env.HIVEMQ_USERNAME;
   const password = process.env.HIVEMQ_PASSWORD;
 
   if (!host || !username || !password) {
-    console.log('ℹ️  HiveMQ: HIVEMQ_HOST / USERNAME / PASSWORD not set in .env');
-    console.log('   MQTT auto-connect skipped — add credentials to enable.\n');
+    console.log('ℹ️  HiveMQ: No credentials in .env — MQTT auto-connect skipped.');
     return;
   }
 
   const config: MqttConfig = {
     host,
-    port:        parseInt(process.env.HIVEMQ_PORT         || '8883'),
+    port: parseInt(process.env.HIVEMQ_PORT || '8883'),
     username,
     password,
-    // Default to 'enviraLog' to match your Arduino publisher
-    topicPrefix: process.env.HIVEMQ_TOPIC_PREFIX          || 'enviraLog',
-    useTls:     (process.env.HIVEMQ_USE_TLS               || 'true') === 'true',
-    // Base clientId — a random suffix is appended inside connectMqtt()
-    clientId:    process.env.HIVEMQ_CLIENT_ID              || 'envirologapp-server',
+    topicPrefix: process.env.HIVEMQ_TOPIC_PREFIX || 'envirologapp',
+    useTls: (process.env.HIVEMQ_USE_TLS || 'true') === 'true',
+    clientId: process.env.HIVEMQ_CLIENT_ID || `envirologapp-server-${Date.now()}`,
   };
 
   connectMqtt(config, wss).catch(err =>
-    console.error('MQTT auto-connect error:', err.message)
+    console.error('MQTT auto-connect failed:', err.message)
   );
 }
 
-// ─── Manual reconnect with 5s backoff ─────────────────────────────────────────
-
-function scheduleReconnect(): void {
-  if (!currentConfig || reconnectTimer) return;
-  console.log('🔄 MQTT: Will reconnect in 5s...');
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    if (!currentConfig || status.connected) return;
-    console.log('🔄 MQTT: Reconnecting...');
-    status.connecting = true;
-    broadcastStatus();
-    connectMqtt(currentConfig, wssRef!).catch(err =>
-      console.error('MQTT reconnect error:', err.message)
-    );
-  }, 5000);
-}
-
-// ─── Message router ────────────────────────────────────────────────────────────
+// ─── Message handling ──────────────────────────────────────────────────────────
 
 async function handleMessage(topic: string, raw: string, topicPrefix: string): Promise<void> {
   status.messagesReceived++;
@@ -276,58 +221,109 @@ async function handleMessage(topic: string, raw: string, topicPrefix: string): P
   const prefix = topicPrefix.replace(/\/$/, '');
 
   try {
-    // enviraLog/status/<deviceId>
+    // Status updates
     const statusMatch = topic.match(new RegExp(`^${esc(prefix)}/status/(.+)$`));
-    if (statusMatch) { await handleStatusMessage(statusMatch[1], raw); return; }
-
-    // enviraLog/node-1/data   ← your exact Arduino pattern
-    // enviraLog/node-1/sensors
-    // enviraLog/sensors/node-1
-    const arduinoMatch = topic.match(new RegExp(`^${esc(prefix)}/([^/]+)/(?:data|sensors?)$`));
-    const sensorMatch  = topic.match(new RegExp(`^${esc(prefix)}/sensors/([^/]+)$`));
-
-    const deviceIdentifier = arduinoMatch?.[1] ?? sensorMatch?.[1];
-    if (!deviceIdentifier) {
-      console.log(`MQTT: Unhandled topic "${topic}" — ignoring`);
+    if (statusMatch) {
+      await handleStatusMessage(statusMatch[1], raw);
       return;
     }
 
-    await handleArduinoPayload(deviceIdentifier, raw);
+    // Sensor data
+    const sensorMatch = topic.match(new RegExp(`^${esc(prefix)}/sensors/([^/]+)(?:/(.+))?$`));
+    if (!sensorMatch) return;
+
+    const deviceId = sensorMatch[1];
+    const field = sensorMatch[2];
+
+    if (field) {
+      await handleSingleField(deviceId, field, raw);
+    } else {
+      await handleFullPayload(deviceId, raw);
+    }
   } catch (err: any) {
     console.error(`MQTT: Error on topic "${topic}":`, err.message);
   }
 }
 
-// ─── Arduino payload handler ───────────────────────────────────────────────────
+// ─── Status messages ──────────────────────────────────────────────────────────
 
-async function handleArduinoPayload(topicDeviceId: string, raw: string): Promise<void> {
+async function handleStatusMessage(deviceId: string, raw: string): Promise<void> {
+  let newStatus = 'OFFLINE';
+  try {
+    const parsed = JSON.parse(raw);
+    newStatus = (parsed.status ?? raw).toString().toUpperCase();
+  } catch {
+    newStatus = raw.trim().toUpperCase();
+  }
+  if (!['ONLINE', 'OFFLINE', 'MAINTENANCE'].includes(newStatus)) return;
+
+  const device = await findDevice(deviceId);
+  if (!device) return;
+
+  const updated = await prisma.device.update({
+    where: { id: device.id },
+    data: { status: newStatus as any },
+    include: { user: { select: { id: true, email: true } } },
+  });
+
+  console.log(`📟 MQTT: [${device.name}] status → ${newStatus}`);
+  if (wssRef) broadcast(wssRef, { type: 'DEVICE_STATUS', payload: updated });
+}
+
+// ─── Full JSON payload ─────────────────────────────────────────────────────────
+
+async function handleFullPayload(deviceId: string, raw: string): Promise<void> {
   let payload: Record<string, any>;
   try {
     payload = JSON.parse(raw);
   } catch {
-    console.warn(`MQTT: Non-JSON from "${topicDeviceId}": ${raw}`);
+    console.warn(`MQTT: Non-JSON payload from device "${deviceId}": ${raw}`);
     return;
   }
+  await persistReading(deviceId, payload);
+}
 
-  // Prefer device_id field inside payload, fall back to topic segment
-  const rawDeviceId = String(payload.device_id ?? topicDeviceId);
-  const device      = await findOrCreateDevice(rawDeviceId);
+// ─── Single-field topic ────────────────────────────────────────────────────────
 
-  const data: Record<string, any> = {
-    deviceId:    device.id,
-    rawDeviceId,
-    temperature: toFloat(payload.temperature),
-    humidity:    toFloat(payload.humidity),
-    airQuality:  toFloat(payload.air_quality ?? payload.airQuality ?? payload.aqi),
-    co2:         toFloat(payload.co2),
-    pm25:        toFloat(payload.pm25 ?? payload.pm2_5),
-    pm10:        toFloat(payload.pm10),
-    noise:       toFloat(payload.noise ?? payload.sound),
-    ph:          toFloat(payload.ph),
-    turbidity:   toFloat(payload.turbidity),
-    flame: payload.flame !== undefined && payload.flame !== null
-      ? payload.flame === true || payload.flame === 'true' || payload.flame === 1
-      : null,
+async function handleSingleField(deviceId: string, field: string, raw: string): Promise<void> {
+  const VALID = ['temperature','humidity','co2','pm25','pm10','noise','ph','turbidity'];
+  if (!VALID.includes(field)) return;
+
+  const value = parseFloat(raw);
+  if (isNaN(value)) return;
+
+  if (!partialReadings.has(deviceId)) {
+    partialReadings.set(deviceId, Object.fromEntries(VALID.map(f => [f, null])));
+  }
+  partialReadings.get(deviceId)![field] = value;
+
+  if (partialTimers.has(deviceId)) clearTimeout(partialTimers.get(deviceId)!);
+  partialTimers.set(deviceId, setTimeout(async () => {
+    const snap = { ...partialReadings.get(deviceId)! };
+    partialReadings.delete(deviceId);
+    partialTimers.delete(deviceId);
+    if (Object.values(snap).some(v => v !== null)) {
+      await persistReading(deviceId, snap);
+    }
+  }, 2000));
+}
+
+// ─── Persist to DB ─────────────────────────────────────────────────────────────
+
+async function persistReading(deviceId: string, payload: Record<string, any>): Promise<void> {
+  const device = await findDevice(deviceId);
+  if (!device) return;
+
+  const data = {
+    deviceId: device.id,
+    temperature: toFloat(payload.temperature ?? payload.temp),
+    humidity: toFloat(payload.humidity ?? payload.hum),
+    co2: toFloat(payload.co2),
+    pm25: toFloat(payload.pm25 ?? payload.pm2_5 ?? payload['pm2.5']),
+    pm10: toFloat(payload.pm10),
+    noise: toFloat(payload.noise ?? payload.sound ?? payload.db),
+    ph: toFloat(payload.ph ?? payload.pH),
+    turbidity: toFloat(payload.turbidity ?? payload.ntu),
   };
 
   const reading = await prisma.sensorData.create({
@@ -337,135 +333,62 @@ async function handleArduinoPayload(topicDeviceId: string, raw: string): Promise
 
   status.readingsSaved++;
 
-  const summary = [
-    data.temperature !== null && `temp=${data.temperature}°`,
-    data.humidity    !== null && `hum=${data.humidity}%`,
-    data.airQuality  !== null && `aqi=${data.airQuality}`,
-    data.flame       !== null && `flame=${data.flame}`,
-  ].filter(Boolean).join(' | ');
-
-  console.log(`💾 MQTT→DB [${rawDeviceId}]: ${summary}`);
-
   if (wssRef) broadcast(wssRef, { type: 'SENSOR_DATA', payload: reading });
 
-  // Auto-mark ONLINE when data arrives
   if (device.status !== 'ONLINE') {
-    await prisma.device.update({ where: { id: device.id }, data: { status: 'ONLINE' } });
-    const updated = await prisma.device.findUnique({ where: { id: device.id } });
+    const updated = await prisma.device.update({
+      where: { id: device.id },
+      data: { status: 'ONLINE' },
+    });
     if (wssRef) broadcast(wssRef, { type: 'DEVICE_STATUS', payload: updated });
   }
 
-  await checkThresholds(data, device.id, rawDeviceId);
+  const { deviceId: _omit, ...numericData } = data;
+  await checkThresholds(numericData, device.id);
 }
 
-// ─── Status topic ──────────────────────────────────────────────────────────────
+// ─── Threshold alerts ─────────────────────────────────────────────────────────
 
-async function handleStatusMessage(deviceId: string, raw: string): Promise<void> {
-  let newStatus = 'OFFLINE';
-  try   { newStatus = (JSON.parse(raw).status ?? raw).toString().toUpperCase(); }
-  catch { newStatus = raw.trim().toUpperCase(); }
-  if (!['ONLINE', 'OFFLINE', 'MAINTENANCE'].includes(newStatus)) return;
-
-  const device = await findDevice(deviceId);
-  if (!device) return;
-
-  const updated = await prisma.device.update({
-    where: { id: device.id }, data: { status: newStatus as any },
-  });
-  if (wssRef) broadcast(wssRef, { type: 'DEVICE_STATUS', payload: updated });
-}
-
-// ─── Threshold / flame alert ───────────────────────────────────────────────────
-
-async function checkThresholds(
-  data: Record<string, any>,
-  deviceId: string,
-  rawDeviceId: string,
-): Promise<void> {
+async function checkThresholds(data: Record<string, number | null>, deviceId: string) {
   const alerts: { message: string; severity: 'LOW'|'MEDIUM'|'HIGH'|'CRITICAL' }[] = [];
 
-  if (data.flame === true) {
-    status.flameAlertsTriggered++;
-    alerts.push({
-      message:  `🔥 FLAME DETECTED by ${rawDeviceId}! Immediate action required.`,
-      severity: 'CRITICAL',
-    });
-  }
-
-  const check = (
-    field: keyof typeof THRESHOLDS,
-    value: number | null,
-    unit: string,
-    label: string,
-  ) => {
+  const check = (field: keyof typeof THRESHOLDS, value: number | null, unit: string) => {
     if (value === null) return;
     const t = THRESHOLDS[field];
     if (value > t.critical) {
-      alerts.push({ message: `🚨 Critical ${label}: ${value}${unit} on ${rawDeviceId}`, severity: 'CRITICAL' });
+      alerts.push({ message: `🚨 Critical ${field.toUpperCase()}: ${value} ${unit}`, severity: 'CRITICAL' });
     } else if (value > t.warning) {
-      alerts.push({ message: `⚠️ High ${label}: ${value}${unit} on ${rawDeviceId}`, severity: 'HIGH' });
+      alerts.push({ message: `⚠️  High ${field.toUpperCase()}: ${value} ${unit}`, severity: 'HIGH' });
     }
   };
 
-  check('temperature', data.temperature, '°',    'Temperature');
-  check('humidity',    data.humidity,    '%',    'Humidity');
-  check('airQuality',  data.airQuality,  ' AQI', 'Air Quality');
-  check('co2',         data.co2,         ' ppm', 'CO₂');
-  check('noise',       data.noise,       ' dB',  'Noise');
+  check('co2', data.co2, 'ppm');
+  check('pm25', data.pm25, 'µg/m³');
+  check('pm10', data.pm10, 'µg/m³');
+  check('temperature', data.temperature, '°C');
+  check('humidity', data.humidity, '%');
+  check('noise', data.noise, 'dB');
 
   for (const a of alerts) {
     const alert = await prisma.alert.create({
-      data:    { message: a.message, severity: a.severity, deviceId },
+      data: { message: a.message, severity: a.severity, deviceId },
       include: { device: { select: { id: true, name: true, location: true } } },
     });
     if (wssRef) broadcast(wssRef, { type: 'ALERT', payload: alert });
-    console.log(`🔔 [${a.severity}] ${a.message}`);
   }
 }
 
-// ─── Device resolution / auto-create ──────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function findDevice(identifier: string) {
-  let d = await prisma.device.findUnique({ where: { id: identifier } });
-  if (d) return d;
-  d = await prisma.device.findFirst({
-    where: { name: { equals: identifier, mode: 'insensitive' } },
-  });
-  return d;
-}
-
-async function findOrCreateDevice(rawId: string) {
-  const existing = await findDevice(rawId);
-  if (existing) return existing;
-
-  console.log(`📦 MQTT: Auto-creating device for "${rawId}"`);
-  const admin = await prisma.user.findFirst({ where: { role: 'ADMIN' } });
-  if (!admin) throw new Error('No admin user — cannot auto-create device');
-
-  const device = await prisma.device.create({
-    data: {
-      name:     rawId,
-      location: 'Auto-registered (Arduino)',
-      type:     'ARDUINO',
-      status:   'ONLINE',
-      userId:   admin.id,
-    },
-  });
-
-  await prisma.systemLog.create({
-    data: {
-      action:  'DEVICE_AUTO_CREATED',
-      userId:  admin.id,
-      details: `Arduino device "${rawId}" auto-registered on first MQTT message`,
-    },
-  });
-
-  if (wssRef) broadcast(wssRef, { type: 'DEVICE_STATUS', payload: device });
-  console.log(`✅ Auto-created device "${rawId}" (id: ${device.id})`);
+  let device = await prisma.device.findUnique({ where: { id: identifier } });
+  if (!device) {
+    device = await prisma.device.findFirst({
+      where: { name: { equals: identifier, mode: 'insensitive' } },
+    });
+  }
   return device;
 }
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function toFloat(val: unknown): number | null {
   if (val === undefined || val === null || val === '') return null;
@@ -475,8 +398,4 @@ function toFloat(val: unknown): number | null {
 
 function esc(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function broadcastStatus(): void {
-  if (wssRef) broadcast(wssRef, { type: 'MQTT_STATUS', payload: getMqttStatus() });
 }
