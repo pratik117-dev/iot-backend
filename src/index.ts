@@ -32,7 +32,7 @@ const PORT = process.env.PORT || 3001;
 
 // ── Security & middleware ───────────────────────────────────────────────────────
 app.use(helmet());
-app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:5173', credentials: true }));
+app.use(cors({ origin: process.env.CLIENT_URL || 'https://iot-frontend-wt67.vercel.app', credentials: true }));
 app.use(compression());
 app.use(morgan('combined'));
 app.use(express.json({ limit: '10mb' }));
@@ -89,7 +89,7 @@ if (simulatorEnabled) {
 httpServer.listen(PORT, async () => {
   console.log(`\n🌍 EnviroLog Server  →  port ${PORT}`);
   console.log(`📡 WebSocket         →  ready`);
-  console.log(`🔗 Client URL        →  ${process.env.CLIENT_URL || 'http://localhost:5173'}`);
+  console.log(`🔗 Client URL        →  ${process.env.CLIENT_URL || 'https://iot-frontend-wt67.vercel.app'}`);
   console.log(`🐝 HiveMQ Host       →  ${process.env.HIVEMQ_HOST || '(not configured)'}\n`);
 
   try {
